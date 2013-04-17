@@ -1,0 +1,12 @@
+Gauche-statifier is a tool to turn Gauche scripts, libraries and DSOs
+into a single binary that can be deployed by itself.  Handy in the
+situation that you can't install Gauche in the ordinary way on the
+target platform.  Written by Rui Ueyama.
+
+It uses some tricks that depends on Gauche internals, and it's unlikely
+to work with the most recent Gauche.  I put this here so that those
+who are interested can hack more.
+
+
+
+

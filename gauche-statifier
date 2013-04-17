@@ -1,0 +1,456 @@
+#!/usr/bin/env gosh
+;;;
+;;;   gauche-statifier 
+;;;      - converts a Gauche script into a stand-alone executable.
+;;;
+;;;   Copyright (c) 2006-2007 Rui Ueyama <rui314@gmail.com>
+;;; 
+;;;   Redistribution and use in source and binary forms, with or without
+;;;   modification, are permitted provided that the following conditions
+;;;   are met:
+;;; 
+;;;   1. Redistributions of source code must retain the above copyright
+;;;      notice, this list of conditions and the following disclaimer.
+;;;
+;;;   2. Redistributions in binary form must reproduce the above copyright
+;;;      notice, this list of conditions and the following disclaimer in the
+;;;      documentation and/or other materials provided with the distribution.
+;;;
+;;;   3. Neither the name of the authors nor the names of its contributors
+;;;      may be used to endorse or promote products derived from this
+;;;      software without specific prior written permission.
+;;;
+;;;   THIS SOFTWARE IS PROVIDED BY THE COPYRIGHT HOLDERS AND CONTRIBUTORS
+;;;   "AS IS" AND ANY EXPRESS OR IMPLIED WARRANTIES, INCLUDING, BUT NOT
+;;;   LIMITED TO, THE IMPLIED WARRANTIES OF MERCHANTABILITY AND FITNESS FOR
+;;;   A PARTICULAR PURPOSE ARE DISCLAIMED. IN NO EVENT SHALL THE COPYRIGHT
+;;;   OWNER OR CONTRIBUTORS BE LIABLE FOR ANY DIRECT, INDIRECT, INCIDENTAL,
+;;;   SPECIAL, EXEMPLARY, OR CONSEQUENTIAL DAMAGES (INCLUDING, BUT NOT LIMITED
+;;;   TO, PROCUREMENT OF SUBSTITUTE GOODS OR SERVICES; LOSS OF USE, DATA, OR
+;;;   PROFITS; OR BUSINESS INTERRUPTION) HOWEVER CAUSED AND ON ANY THEORY OF
+;;;   LIABILITY, WHETHER IN CONTRACT, STRICT LIABILITY, OR TORT (INCLUDING
+;;;   NEGLIGENCE OR OTHERWISE) ARISING IN ANY WAY OUT OF THE USE OF THIS
+;;;   SOFTWARE, EVEN IF ADVISED OF THE POSSIBILITY OF SUCH DAMAGE.
+;;;
+;;;  $Id: gauche-statifier,v 1.2 2007-03-09 04:55:18 rui314159 Exp $
+;;;
+
+;;; Gauche-statifier converts a Gauche script, Scheme libraries that
+;;; are loaded from the script, and DSOs into one binary file.  This
+;;; file can run on another machine without need to install Gauche and
+;;; its libraries (and even libc).
+;;;
+;;; Creating pseudo-statically linked file is done by `statifier'
+;;; command.  Below is the process flow of gauche-statifier:
+;;;
+;;;  (1) Loads the specified script file with `-fload-verbose' option
+;;;      to get a list of libraries and DSOs that are needed to run
+;;;      the script.
+;;; 
+;;;  (2) Creates a C program that contains all Scheme libraries and
+;;;      the script file, and compile it.
+;;;
+;;;  (3) Runs statifier to create a pseudo-static binary file from an
+;;;      output of (2) and DSOs.
+;;;
+;;; The order of the embedded Scheme libraries is important; we sorted
+;;; them to satisfy dependencies all the time, so that Gauche didn't
+;;; try to find *.scm file.
+;;;
+;;; It replaces libgauche's Scm_FindFile function.  The replaced
+;;; function is used to find DSO, and it raises an error when the DSO
+;;; is missing.  That behavior is undesirable because an executable
+;;; that is created by statifier preloads all DSOs and it does not
+;;; need to find any DSO at runtime.  The Scm_FindFile defined here
+;;; always returns success when trying to find a DSO that was
+;;; preloaded.
+;;;
+;;; A script that needs to load library at runtime fails to run.
+;;; Because loading library is processed at compile time, you usually
+;;; do not worry about that.  However, you would test before you move
+;;; a file to the another machine.  I test a file by followings:
+;;;
+;;;   - run with strace, and check if it does not load unnecessary
+;;;     file.
+;;;   - chroot to a directory that contains no file except `/proc'
+;;;     (Boehm GC needs this).
+;;;
+;;; I test this program on Ubuntu 6.06 and Red Hat Enteprise Linux 4.
+;;;
+;;; See also: statifier - http://statifier.sourceforge.net/
+;;;
+;;;
+
+(use srfi-1)
+(use srfi-13)
+(use util.match)
+(use file.util)
+(use gauche.parseopt)
+(use gauche.config)
+(use gauche.process)
+
+(define *gosh-path* #f)
+
+(define (tr iport table)
+  (call-with-output-string
+    (lambda (out)
+      (port-for-each
+       (lambda (c)
+         (cond ((assv c table)
+                => (lambda (p) (display (cadr p) out)))
+               (else (write-char c out))))
+       (cut read-char iport)))))
+
+(define (get-load-history script-file)
+  ;;; To load autoload'ed modules, scan all identifiers reachable from
+  ;;; `user' module.
+  (define resolve-all-autoloads
+    '(let ()
+       (define code->list (with-module gauche.internal vm-code->list))
+       (define %gloc-ref (with-module gauche.internal gloc-ref))
+       (define seen (make-hash-table 'eq?))
+       (define (resolve-binding ident)
+         (global-variable-ref (slot-ref ident 'module)
+                              (slot-ref ident 'name)
+                              #f))
+       (define (scan-value val)
+         (unless (hash-table-exists? seen val)
+           (hash-table-put! seen val #t)
+           (cond ((identifier? val)
+                  (scan-value (resolve-binding val)))
+                 ((is-a? val <gloc>)
+                  (scan-value (%gloc-ref val)))
+                 ((closure? val)
+                  (scan-code (closure-code val)))
+                 ((is-a? val <compiled-code>)
+                  (scan-code val)))))
+       (define (scan-code code)
+         (for-each (lambda (c)
+                     (unless (pair? c)
+                       (scan-value c)))
+                   (code->list code)))
+       (define (scan-module module)
+         (hash-table-for-each (module-table module)
+                              (lambda (sym val)
+                                (scan-value val))))
+       (scan-module (find-module 'user))))
+  (define (print-command cmd-args)
+    (print *gosh-path* " "
+           (string-join
+            (map (lambda (s)
+                   (string-append "'"
+                                  (tr (open-input-string s)
+                                      '((#\' "'\\''")))
+                                  "'"))
+                 cmd-args))))
+  (let1 cmd-args (list "-fload-verbose"
+                       #`"-Eload \",script-file\""
+                       #`"-e,resolve-all-autoloads"
+                       "-Eexit")
+    (print-command cmd-args)
+    (let1 proc (apply run-process *gosh-path* :error :pipe cmd-args)
+      (begin0
+       (filter (lambda (s) (not (string-null? s)))
+               (port->string-list (process-error proc)))
+       (process-wait proc)))))
+
+(define (parse-load-history lines)
+  (let loop ((scm '()) (dso '()) (lines lines))
+    (cond ((null? lines)
+           (values (reverse! scm) (reverse! dso)))
+          ((#/^\;\;\s*Dynamically Loading (.+)\.\.\.$/ (car lines))
+           => (lambda (m)
+                (loop scm (cons (m 1) dso) (cdr lines))))
+          ((#/^\;\;(\s*)Loading (\S+)\.\.\.$/ (car lines))
+           => (lambda (m)
+                (loop (acons (string-length (m 1)) (m 2) scm)
+                      dso
+                      (cdr lines))))
+          (else (error "malformed load history:" (car lines))))))
+
+(define (construct-dependency-tree lis)
+  (define (sub lis cont)
+    (let1 head-level (caar lis)
+      (let loop ((r (list (cdar lis)))
+                 (lis (cdr lis)))
+        (match lis
+          (() (cont (reverse! r) '()))
+          (((lv . obj) . rest)
+           (cond ((= head-level lv)
+                  (loop (cons obj r) rest))
+                 ((< head-level lv)
+                  (sub lis
+                       (lambda (st rest)
+                         (loop (cons st r) rest))))
+                 (else
+                  (cont (reverse! r) lis))))))))
+  (if (null? lis)
+    '()
+    (sub lis (lambda (r _) r))))
+
+(define (sort-dependency-tree tree)
+  (let loop ((tree tree))
+    (match tree
+      (() '())
+      ((v1 (v2 ...) . rest)
+       `(,@(loop v2) ,v1 ,@(loop rest)))
+      ((v1 . rest)
+       (cons v1 (loop rest))))))
+
+(define (list-dependency script-file)
+  (receive (scm-files dso-files)
+      (parse-load-history (get-load-history script-file))
+    (values (sort-dependency-tree
+             (construct-dependency-tree scm-files))
+            dso-files)))
+
+(define (canonicalize-script-name script-file)
+  (if (#/^\// script-file)
+    script-file
+    (string-append "./" script-file)))
+
+(define (compile cfile ofile)
+  (let* ((cc      (gauche-config "--cc"))
+         (cflags  (gauche-config "-I"))
+         (ldflags (gauche-config "-L"))
+         (libs    (gauche-config "-l"))
+         (cmd #`",cc -g ,cflags -o ,ofile ,ldflags ,cfile ,libs"))
+    (print cmd)
+    (sys-system cmd)))
+
+(define (usage)
+  (print "Usage: gosh-statifier [ -g gosh ] [ -o outfile ] <script>")
+  (exit 2))
+
+;;; DSOs that are in Gauche's `src/ext' directory are not compiled to
+;;; depend on libgauche.  Statifier reports an error when preload
+;;; these DSOs, because it cannot resolve symbols that is in
+;;; libgauche.  So, to avoid that problem, we preload all modules that
+;;; Gosh depends.
+(define (ldd file)
+  (let loop ((r '())
+             (lines (port->string-list
+                     (open-input-process-port `("ldd" ,file)))))
+    (cond ((null? lines)
+           (reverse! r))
+          ((#/^\s*lib\S+\s*=>\s*(\/\S+\d)/ (car lines))
+           => (lambda (m)
+                (loop (cons (m 1) r) (cdr lines))))
+          (else (loop r (cdr lines))))))
+
+(define (statify from to prelink)
+  (let* ((dso (append (ldd *gosh-path*) prelink))
+         (cmd #`"statifier --set=LD_BIND_NOW=yes --set='LD_PRELOAD=,(string-join dso \" \")' ,from ,to"))
+    (print cmd)
+    (sys-system cmd)))
+
+(define (generate-cprog scm-files dso-files)
+  (define (p . args)
+    (for-each print args))
+
+  (define (emit-scmeval-sub file)
+    (display "\"(begin ")
+    (call-with-input-file file
+      (lambda (in)
+        (display (tr in '((#\newline "\\n")
+                          (#\return "\\r")
+                          (#\\ "\\\\")
+                          (#\" "\\\""))))))
+    (display ")\""))
+
+  (define (emit-scmeval file)
+    (p "r = Scm_EvalCString(")
+    (emit-scmeval-sub file)
+    (p ","
+       "                    SCM_OBJ(usermod),"
+       "                    &epak);"
+       "    if (r < 0) {"
+       #`"        Scm_Printf(SCM_CURERR, \"Error during loading script ,|file|:\\n%S\\n\","
+       "                   epak.exception);"
+       "    }"))
+
+;;; regfilep(), try_suffixes(), and Scm_FindFile() derive from Gauche
+;;; 0.8.8's src/load.c.
+;;;
+;;; /*
+;;;  * load.c - load a program
+;;;  *
+;;;  *   Copyright (c) 2000-2005 Shiro Kawai, All rights reserved.
+;;;  * 
+;;;  *   Redistribution and use in source and binary forms, with or without
+;;;  *   modification, are permitted provided that the following conditions
+;;;  *   are met:
+;;;  * 
+;;;  *   1. Redistributions of source code must retain the above copyright
+;;;  *      notice, this list of conditions and the following disclaimer.
+;;;  *
+;;;  *   2. Redistributions in binary form must reproduce the above copyright
+;;;  *      notice, this list of conditions and the following disclaimer in the
+;;;  *      documentation and/or other materials provided with the distribution.
+;;;  *
+;;;  *   3. Neither the name of the authors nor the names of its contributors
+;;;  *      may be used to endorse or promote products derived from this
+;;;  *      software without specific prior written permission.
+;;;  *
+;;;  *   THIS SOFTWARE IS PROVIDED BY THE COPYRIGHT HOLDERS AND CONTRIBUTORS
+;;;  *   "AS IS" AND ANY EXPRESS OR IMPLIED WARRANTIES, INCLUDING, BUT NOT
+;;;  *   LIMITED TO, THE IMPLIED WARRANTIES OF MERCHANTABILITY AND FITNESS FOR
+;;;  *   A PARTICULAR PURPOSE ARE DISCLAIMED. IN NO EVENT SHALL THE COPYRIGHT
+;;;  *   OWNER OR CONTRIBUTORS BE LIABLE FOR ANY DIRECT, INDIRECT, INCIDENTAL,
+;;;  *   SPECIAL, EXEMPLARY, OR CONSEQUENTIAL DAMAGES (INCLUDING, BUT NOT LIMITED
+;;;  *   TO, PROCUREMENT OF SUBSTITUTE GOODS OR SERVICES; LOSS OF USE, DATA, OR
+;;;  *   PROFITS; OR BUSINESS INTERRUPTION) HOWEVER CAUSED AND ON ANY THEORY OF
+;;;  *   LIABILITY, WHETHER IN CONTRACT, STRICT LIABILITY, OR TORT (INCLUDING
+;;;  *   NEGLIGENCE OR OTHERWISE) ARISING IN ANY WAY OUT OF THE USE OF THIS
+;;;  *   SOFTWARE, EVEN IF ADVISED OF THE POSSIBILITY OF SUCH DAMAGE.
+;;;  *
+;;;  *  $Id: gauche-statifier,v 1.2 2007-03-09 04:55:18 rui314159 Exp $
+;;;  */
+
+  (define (emit-find-file)
+    (p "static const char *dso_files[] = {")
+    (for-each (lambda (path) (p #`"\",path\",")) dso-files)
+    (p "NULL };"
+       "static int regfilep(ScmObj path)"
+       "{"
+       "    struct stat statbuf;"
+       "    const char *cpath = Scm_GetStringConst(SCM_STRING(path));"
+       "    const char **dsop = dso_files;"
+       "    while (*dsop) {"
+       "        if (strncmp(*dsop, cpath, strlen(*dsop)) == 0) return TRUE;"
+       "        dsop++;"
+       "    }"
+       "    int r = stat(cpath, &statbuf);"
+       "    if (r < 0) return FALSE;"
+       "    return S_ISREG(statbuf.st_mode);"
+       "}"
+       "static ScmObj try_suffixes(ScmObj base, ScmObj suffixes)"
+       "{"
+       "    ScmObj sp, fpath;"
+       "    if (regfilep(base)) return base;"
+       "    SCM_FOR_EACH(sp, suffixes) {"
+       "        fpath = Scm_StringAppend2(SCM_STRING(base), SCM_STRING(SCM_CAR(sp)));"
+       "        if (regfilep(fpath)) return fpath;"
+       "    }"
+       "    return SCM_FALSE;"
+       "}"
+       "ScmObj Scm_FindFile(ScmString *filename, ScmObj *paths,"
+       "                    ScmObj suffixes, int flags)"
+       "{"
+       "    u_int size;"
+       "    const char *ptr = Scm_GetStringContent(filename, &size, NULL, NULL);"
+       "    int use_load_paths = TRUE;"
+       "    ScmObj file = SCM_OBJ(filename), fpath = SCM_FALSE;"
+       "    if (size == 0) Scm_Error(\"bad filename to load: \\\"\\\"\");"
+       "    if (*ptr == '~') {"
+       "        file = Scm_NormalizePathname(filename, SCM_PATH_EXPAND);"
+       "        use_load_paths = FALSE;"
+       "    } else if (*ptr == '/'"
+       "               || (*ptr == '.' && *(ptr+1) == '/')"
+       "               || (*ptr == '.' && *(ptr+1) == '.' && *(ptr+2) == '/')) {"
+       "        use_load_paths = FALSE;"
+       "    }"
+       "    if (use_load_paths) {"
+       "        ScmObj lpath;"
+       "        SCM_FOR_EACH(lpath, *paths) {"
+       "            if (!SCM_STRINGP(SCM_CAR(lpath))) {"
+       "                Scm_Warn(\"*load-path* contains invalid element: %S\", *paths);"
+       "            }"
+       "            fpath = Scm_StringAppendC(SCM_STRING(SCM_CAR(lpath)), \"/\", 1, 1);"
+       "            fpath = Scm_StringAppend2(SCM_STRING(fpath), SCM_STRING(file));"
+       "            fpath = try_suffixes(fpath, suffixes);"
+       "            if (!SCM_FALSEP(fpath)) break;"
+       "        }"
+       "        if (SCM_PAIRP(lpath)) {"
+       "            *paths = SCM_CDR(lpath);"
+       "            return SCM_OBJ(fpath);"
+       "        } else if (!(flags&SCM_LOAD_QUIET_NOFILE)) {"
+       "            Scm_Error(\"cannot find file %S in *load-path* %S\", file, *paths);"
+       "        } else {"
+       "            *paths = SCM_NIL;"
+       "        }"
+       "    } else {"
+       "        *paths = SCM_NIL;"
+       "        fpath = try_suffixes(file, suffixes);"
+       "        if (!SCM_FALSEP(fpath)) return fpath;"
+       "        if (!(flags&SCM_LOAD_QUIET_NOFILE)) {"
+       "            Scm_Error(\"cannot find file %S to load\", file);"
+       "        }"
+       "    }"
+       "    return SCM_FALSE;"
+       "}"))
+  
+  (define (emit-main)
+    (p "int main(int argc, char **argv)"
+       "{"
+       "    ScmObj av = SCM_NIL, at = SCM_NIL;"
+       "    ScmModule *usermod;"
+       "    int i, r, exit_code = 0;"
+       "    ScmEvalPacket epak;"
+       "    ScmObj mainproc;"
+       "    GC_INIT();"
+       "    Scm_Init(GAUCHE_SIGNATURE);"
+       "    for (i=0; i<argc; i++) {"
+       "        SCM_APPEND1(av, at, SCM_MAKE_STR(argv[i]));"
+       "    }"
+       "    usermod = Scm_UserModule();"
+       "    SCM_DEFINE(usermod, \"*argv*\", SCM_CDR(av));"
+       "    SCM_DEFINE(usermod, \"*program-name*\", SCM_CAR(av));")
+    (for-each emit-scmeval scm-files)
+    (p "    mainproc = Scm_SymbolValue(usermod,"
+       "                               SCM_SYMBOL(SCM_INTERN(\"main\")));"
+       "    if (SCM_PROCEDUREP(mainproc)) {"
+       "        r = Scm_Apply(mainproc, SCM_LIST1(av), &epak);"
+       "        if (r > 0) {"
+       "            ScmObj res = epak.results[0];"
+       "            if (SCM_INTP(res)) exit_code = SCM_INT_VALUE(res);"
+       "            else exit_code = 70;  /* EX_SOFTWARE, see SRFI-22. */"
+       "        } else {"
+       "            /* NB: better error reporting for uncaptured errors? */"
+       "            Scm_ReportError(epak.exception);"
+       "            exit_code = 70;  /* EX_SOFTWARE, see SRFI-22. */"
+       "        }"
+       "    }"
+       "    Scm_Exit(exit_code);"
+       "    return 0;"
+       "}"))
+
+  (receive (out tmpfile) (sys-mkstemp "tmp")
+    (with-output-to-port out
+      (lambda ()
+        (p "#define GAUCHE_API_0_8_8 1"
+	   "#include <gauche.h>"
+           "#include <sys/stat.h>"
+           "#include <string.h>")
+        (emit-find-file)
+        (emit-main)))
+    (close-output-port out)
+    (let1 cfile #`",|tmpfile|.c"
+      (sys-rename tmpfile cfile)
+      cfile)))
+
+(define (main args)
+  (let-args (cdr args)
+      ((outfile "o=s")
+       (gosh "g=s")
+       (help "h|help" => (cut usage))
+       . args)
+    (when (null? args) (usage))
+    (let* ((ifile (canonicalize-script-name (car args)))
+           (ofile (or outfile
+                      (if (#/\.scm$/ ifile)
+                        (regexp-replace #/\.scm$/ ifile "")
+                        #`",|ifile|.out"))))
+      (set! *gosh-path* (or gosh
+                            (find-file-in-paths "gosh")))
+      (receive (out binfile) (sys-mkstemp "tmp")
+        (guard (e (else (sys-unlink binfile) (raise e)))
+          (close-output-port out)
+          (receive (scm dso)
+              (list-dependency ifile)
+            (let1 cfile (generate-cprog scm dso)
+              (compile cfile binfile)
+              (guard (e (else (sys-unlink cfile) (raise e)))
+                (statify binfile ofile dso)
+                (for-each sys-unlink (list cfile binfile)))))))))
+  0)
